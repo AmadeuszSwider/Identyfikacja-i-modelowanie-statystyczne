@@ -17,16 +17,13 @@ def load_raw_image(path):
         )
     return rgb
 
-
-# 2. Konwersja RGB -> YCbCr
-def rrgb_to_ycbcr(img):
+def ycbcr_to_rgb(img):
     img = img.astype(np.float32)
-    img = np.clip(img, 0, 255)
-    YCbCr = np.empty_like(img)
-    YCbCr[..., 0] = 0.299 * img[..., 0] + 0.587 * img[..., 1] + 0.114 * img[..., 2]  # Y
-    YCbCr[..., 1] = -0.168736 * img[..., 0] - 0.331264 * img[..., 1] + 0.5 * img[..., 2] + 128  # Cb
-    YCbCr[..., 2] = 0.5 * img[..., 0] - 0.418688 * img[..., 1] - 0.081312 * img[..., 2] + 128  # Cr
-    return YCbCr
+    rgb = np.empty_like(img)
+    rgb[..., 0] = img[..., 0] + 1.402 * (img[..., 2] - 128)
+    rgb[..., 1] = img[..., 0] - 0.344136 * (img[..., 1] - 128) - 0.714136 * (img[..., 2] - 128)
+    rgb[..., 2] = img[..., 0] + 1.772 * (img[..., 1] - 128)
+    return np.clip(rgb, 0, 255)
 
 def rgb_to_ycbcr(img, saturation=1.0):
     img = img.astype(np.float32)
@@ -64,6 +61,9 @@ def dct2_matrix(block):
     return D @ block @ D.T
 
 
+def idct2_matrix(block):
+    return D.T @ block @ D
+    
 # 3. Podział na bloki 8x8 i DCT
 def block_process(channel, block_size=8):
     h, w = channel.shape
@@ -77,6 +77,15 @@ def block_process(channel, block_size=8):
                 dct_blocks.append(dct)
     return dct_blocks
 
+def blocks_to_image(blocks, h, w, block_size=8):
+    image = np.zeros((h, w), dtype=np.float32)
+    idx = 0
+    for i in range(0, h, block_size):
+        for j in range(0, w, block_size):
+            if idx < len(blocks):
+                image[i:i+block_size, j:j+block_size] = blocks[idx]
+                idx += 1
+    return image
 
 # 4. Kwantyzacja (dla uproszczenia używamy standardowej macierzy)
 QY = np.array([
@@ -137,44 +146,51 @@ def generate_codes(node, prefix="", codebook=None):
     return codebook
 
 
-# 6. Zapisz jako JPEG
-def save_as_jpeg(rgb_array, out_path):
-    img = Image.fromarray(rgb_array.astype(np.uint8))
-    img.save(out_path, "JPEG", quality=100)
 
 
-# 7. Główna funkcja
-def compress_arw_to_jpeg(arw_path, jpeg_path):
+def reconstruct_and_save_custom_dct(arw_path, out_path="rekonstrukcja.jpg"):
     rgb = load_raw_image(arw_path)
-    ycbcr = rgb_to_ycbcr(rgb,saturation=1.0)
+    ycbcr = rgb_to_ycbcr(rgb)
 
-    y_blocks = block_process(ycbcr[..., 0])
+    y = ycbcr[..., 0]
+    cb = ycbcr[..., 1]
+    cr = ycbcr[..., 2]
+
+    h, w = y.shape
+    y_blocks = block_process(y)
     y_quant = quantize(y_blocks)
 
-    # Flatten do Huffmana (dla uproszczenia tylko kanał Y)
-    flat = np.concatenate([block.flatten() for block in y_quant])
-    tree = build_huffman_tree(flat)
-    codebook = generate_codes(tree)
+    # Dekwantyzacja
+    y_dequant = [block * QY for block in y_quant]
 
-    print("Przykładowy kod Huffmana:", dict(list(codebook.items())[:10]))
+    # IDCT
+    y_reconstructed_blocks = [idct2_matrix(block) for block in y_dequant]
 
-    # Finalny zapis do JPEG (RGB, nie kodowane YCbCr w tej wersji)
-    save_as_jpeg(rgb, jpeg_path)
-    print(f"Zapisano JPEG: {jpeg_path}")
+    # Składanie kanału Y
+    y_rec = blocks_to_image(y_reconstructed_blocks, h, w)
 
+    # Składanie obrazu YCbCr
+    ycbcr_rec = np.stack([y_rec, cb, cr], axis=-1)
+
+    # YCbCr → RGB
+    rgb_rec = ycbcr_to_rgb(ycbcr_rec)
+    rgb_rec = np.clip(rgb_rec, 0, 255).astype(np.uint8)
+
+    # Zapisz wynik
+    Image.fromarray(rgb_rec).save(out_path)
+    print(f"Zapisano zrekonstruowany obraz z własnej kompresji jako: {out_path}")
     original_size = os.path.getsize(arw_path)
-    jpeg_size = os.path.getsize(jpeg_path)
+    jpeg_size = os.path.getsize(out_path)
     print(f"Rozmiar oryginalnego pliku ARW: {original_size / (1024 * 1024):.2f} MB")
     print(f"Rozmiar przetworzonego pliku JPEG: {jpeg_size / (1024 * 1024):.2f} MB")
     print(f"Stopień kompresji: {( 100 - (100*jpeg_size/original_size))} %")
 
 
 if __name__ == '__main__':
-    compress_arw_to_jpeg("D:/Pobrane/kot.ARW", "wynik.jpg")
-
+    reconstruct_and_save_custom_dct("D:/Pobrane/kot.ARW", "rekonstrukcja.jpg")
 
     # Wczytaj ponownie zapisany JPEG
-    jpeg_loaded = np.array(Image.open("wynik.jpg")).astype(np.float32)
+    jpeg_loaded = np.array(Image.open("rekonstrukcja.jpg")).astype(np.float32)
     rgb = load_raw_image("D:/Pobrane/kot.ARW")
     # Oblicz różnicę i wzmocnij
     diff = np.abs(rgb.astype(np.float32) - jpeg_loaded)
@@ -184,3 +200,4 @@ if __name__ == '__main__':
     # Zapisz różnicę jako obraz
     Image.fromarray(diff).save("roznica.jpg")
     print("Zapisano obraz różnicy: roznica.jpg")
+
